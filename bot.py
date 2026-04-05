@@ -16,7 +16,7 @@ from telegram.ext import (
     filters,
 )
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8743059371:AAGRTfddWmFwjpfBzdp20_HbeOcWk0ifd3A")
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8743059371:AAFk2BJ_YDAH16Hl_sIEU4ssDRXc6JALTnQ")
 
 DOWNLOAD_DIR = Path("downloads")
 DOWNLOAD_DIR.mkdir(exist_ok=True)
