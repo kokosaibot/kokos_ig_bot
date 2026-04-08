@@ -19,6 +19,23 @@ from telegram.ext import (
 )
 
 # =========================
+# SAVE COOKIES FROM RAILWAY VARIABLE
+# =========================
+def save_cookies() -> None:
+    cookies = os.getenv("YOUTUBE_COOKIES")
+    if not cookies:
+        print("❌ Нет YOUTUBE_COOKIES в переменных")
+        return
+
+    with open("cookies.txt", "w", encoding="utf-8") as f:
+        f.write(cookies)
+
+    print("✅ Cookies загружены")
+
+
+save_cookies()
+
+# =========================
 # CONFIG
 # =========================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -163,7 +180,6 @@ def yt_base_opts() -> dict:
         "fragment_retries": 2,
     }
 
-    # Важно: cookies помогают с YouTube anti-bot
     if COOKIE_FILE.exists():
         opts["cookiefile"] = str(COOKIE_FILE)
 
