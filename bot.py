@@ -42,7 +42,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger("kokos_ig_bot")
+logger = logging.getLogger("kokos_bot")
 
 # =========================
 # DATABASE
@@ -177,7 +177,6 @@ def get_youtube_info(url: str) -> dict:
 
 
 def format_for_height(height: int) -> str:
-    # Сначала пытаемся взять mp4 + m4a, потом fallback на просто best<=height
     return (
         f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
         f"best[height<={height}][ext=mp4]/"
@@ -198,10 +197,12 @@ def download_youtube_video(url: str, height: int) -> Tuple[Path, str]:
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         final_path = Path(ydl.prepare_filename(info))
+
         if final_path.suffix.lower() != ".mp4":
             mp4_candidate = final_path.with_suffix(".mp4")
             if mp4_candidate.exists():
                 final_path = mp4_candidate
+
         title = info.get("title") or "video"
         return final_path, title
 
@@ -228,7 +229,6 @@ def download_youtube_audio(url: str) -> Tuple[Path, str]:
 
 
 def download_generic_media(url: str) -> Tuple[Path, str, str]:
-    # Для Instagram/TikTok/public links best-effort
     file_id = str(uuid.uuid4())
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
@@ -262,12 +262,14 @@ def youtube_keyboard(token: str) -> InlineKeyboardMarkup:
 async def send_broadcast(application, text: str) -> tuple[int, int]:
     sent = 0
     failed = 0
+
     for user_id in get_all_user_ids():
         try:
             await application.bot.send_message(chat_id=user_id, text=text)
             sent += 1
         except Exception:
             failed += 1
+
     return sent, failed
 
 
@@ -278,16 +280,23 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     add_user(user.id, user.username, user.first_name)
 
-    await update.message.reply_text(
+    text = (
         "Салам 👋\n\n"
-        "Отправь ссылку на YouTube / Instagram / TikTok.\n\n"
-        "YouTube: бот покажет кнопки 240p / 360p / 480p / MP3 / Превью.\n"
-        "Instagram/TikTok: попробует скачать сразу.\n\n"
-        "Админ:\n"
-        "/users\n"
-        "/stats\n"
-        "/broadcast"
+        "Отправь ссылку на:\n"
+        "- Instagram\n"
+        "- YouTube\n"
+        "- TikTok"
     )
+
+    if user.id == ADMIN_ID:
+        text += (
+            "\n\nАдмин-команды:\n"
+            "/users\n"
+            "/stats\n"
+            "/broadcast"
+        )
+
+    await update.message.reply_text(text)
 
 
 async def users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -308,12 +317,14 @@ async def stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = "📊 Статистика:\n\n"
     for platform, media_type, count in stats:
         text += f"{platform} | {media_type} — {count}\n"
+
     await update.message.reply_text(text)
 
 
 async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if update.effective_user.id != ADMIN_ID:
         return
+
     broadcast_waiting.add(update.effective_user.id)
     await update.message.reply_text("Отправь следующим сообщением текст для рассылки.")
 
@@ -324,6 +335,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
     user = update.effective_user
+
     if not message or not user:
         return
 
@@ -339,6 +351,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await message.reply_text("⏳ Начал рассылку...")
         sent, failed = await send_broadcast(context.application, text)
         broadcast_waiting.discard(user.id)
+
         await message.reply_text(
             f"✅ Рассылка завершена\n\n"
             f"Отправлено: {sent}\n"
@@ -400,7 +413,6 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             await status.delete()
             return
 
-        # Instagram / TikTok
         media_path, title, ext = await asyncio.to_thread(download_generic_media, url)
 
         if not media_path.exists():
@@ -417,7 +429,10 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 await message.reply_video(video=f, caption=f"✅ {title[:900]}")
                 add_stat(user.id, platform, "video")
             else:
-                await message.reply_document(document=InputFile(f, filename=media_path.name), caption=f"✅ {title[:900]}")
+                await message.reply_document(
+                    document=InputFile(f, filename=media_path.name),
+                    caption=f"✅ {title[:900]}"
+                )
                 add_stat(user.id, platform, "file")
 
         await status.delete()
@@ -437,6 +452,7 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 
     user = update.effective_user
     data = (query.data or "").split("|")
+
     if len(data) != 3 or data[0] != "yt":
         return
 
@@ -445,10 +461,13 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     item = pending_youtube.get(token)
 
     if not item:
-        await query.edit_message_caption(
-            caption="❌ Ссылка устарела. Отправь ссылку заново.",
-            reply_markup=None,
-        )
+        try:
+            await query.edit_message_caption(
+                caption="❌ Ссылка устарела. Отправь заново.",
+                reply_markup=None,
+            )
+        except Exception:
+            await query.message.reply_text("❌ Ссылка устарела. Отправь заново.")
         return
 
     if item["user_id"] != user.id and user.id != ADMIN_ID:
@@ -482,6 +501,7 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     title=audio_title[:64],
                     caption="🎧 Готово"
                 )
+
             add_stat(user.id, "youtube", "audio")
             safe_delete(audio_path)
             await processing.delete()
@@ -500,6 +520,7 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     video=f,
                     caption=f"✅ {video_title[:900]}"
                 )
+
             add_stat(user.id, "youtube", f"video_{height}p")
             safe_delete(video_path)
             await processing.delete()
