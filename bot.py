@@ -8,12 +8,7 @@ from pathlib import Path
 from typing import Optional, Tuple
 
 import yt_dlp
-from telegram import (
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    InputFile,
-    Update,
-)
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
 from telegram.ext import (
     ApplicationBuilder,
     CallbackQueryHandler,
@@ -37,6 +32,7 @@ DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 DB_PATH = BASE_DIR / "bot.db"
+COOKIE_FILE = BASE_DIR / "cookies.txt"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -158,7 +154,7 @@ def cleanup_old_downloads() -> None:
 
 
 def yt_base_opts() -> dict:
-    return {
+    opts = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -166,6 +162,12 @@ def yt_base_opts() -> dict:
         "retries": 2,
         "fragment_retries": 2,
     }
+
+    # Важно: cookies помогают с YouTube anti-bot
+    if COOKIE_FILE.exists():
+        opts["cookiefile"] = str(COOKIE_FILE)
+
+    return opts
 
 
 def get_youtube_info(url: str) -> dict:
@@ -550,7 +552,6 @@ def main() -> None:
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-
     app.add_handler(CallbackQueryHandler(youtube_callback, pattern=r"^yt\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
