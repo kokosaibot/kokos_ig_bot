@@ -30,7 +30,7 @@ def save_cookies() -> None:
     with open("cookies.txt", "w", encoding="utf-8") as f:
         f.write(cookies)
 
-    print("✅ Cookies загружены")
+    print("✅ YouTube cookies загружены")
 
 
 save_cookies()
@@ -194,21 +194,114 @@ def get_youtube_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def format_for_height(height: int) -> str:
-    return (
-        f"bestvideo[height<={height}]+bestaudio/"
-        f"best[height<={height}]/"
-        f"best"
-    )
+def build_youtube_formats(info: dict) -> list[dict]:
+    """
+    Собираем доступные видео-форматы по реальным данным ролика.
+    Делаем максимум несколько кнопок, без дублей по высоте.
+    """
+    formats = info.get("formats", [])
+    grouped: dict[int, dict] = {}
+
+    for f in formats:
+        height = f.get("height")
+        fmt_id = f.get("format_id")
+        vcodec = f.get("vcodec")
+        ext = f.get("ext")
+
+        if not height or not fmt_id:
+            continue
+
+        # Пропускаем чисто аудио
+        if vcodec == "none":
+            continue
+
+        # Берем только адекватные качества
+        if height < 144:
+            continue
+
+        # Сохраняем один лучший кандидат на каждую высоту
+        current = grouped.get(height)
+        score = 0
+
+        # Предпочтение mp4 / формату с аудио / более полному описанию
+        if ext == "mp4":
+            score += 3
+        if f.get("acodec") and f.get("acodec") != "none":
+            score += 2
+        if f.get("filesize"):
+            score += 1
+        if f.get("tbr"):
+            score += 1
+
+        candidate = {
+            "height": height,
+            "format_id": fmt_id,
+            "ext": ext or "",
+            "has_audio": f.get("acodec") not in (None, "none"),
+            "score": score,
+        }
+
+        if current is None or candidate["score"] > current["score"]:
+            grouped[height] = candidate
+
+    # Сортируем по высоте
+    result = sorted(grouped.values(), key=lambda x: x["height"])
+
+    # Ограничим разумным числом кнопок
+    if len(result) > 6:
+        # берем 6 распределенных качеств
+        indices = []
+        for i in range(6):
+            idx = round(i * (len(result) - 1) / 5)
+            if idx not in indices:
+                indices.append(idx)
+        result = [result[i] for i in indices]
+
+    return result
 
 
-def download_youtube_video(url: str, height: int) -> Tuple[Path, str]:
+def youtube_keyboard(token: str, format_buttons: list[dict]) -> InlineKeyboardMarkup:
+    rows = []
+    current_row = []
+
+    for item in format_buttons:
+        label = f'{item["height"]}p'
+        current_row.append(
+            InlineKeyboardButton(label, callback_data=f'yt|fmt|{token}|{item["height"]}')
+        )
+        if len(current_row) == 3:
+            rows.append(current_row)
+            current_row = []
+
+    if current_row:
+        rows.append(current_row)
+
+    rows.append([
+        InlineKeyboardButton("🎧 MP3", callback_data=f"yt|mp3|{token}|0"),
+        InlineKeyboardButton("🖼 Превью", callback_data=f"yt|thumb|{token}|0"),
+    ])
+
+    return InlineKeyboardMarkup(rows)
+
+
+def build_download_format(item: dict) -> str:
+    """
+    Если у выбранного формата нет аудио — добавляем bestaudio.
+    Если аудио уже есть — качаем его как есть.
+    """
+    fmt_id = item["format_id"]
+    if item["has_audio"]:
+        return fmt_id
+    return f"{fmt_id}+bestaudio/best"
+
+
+def download_youtube_video_by_format(url: str, item: dict) -> Tuple[Path, str]:
     file_id = str(uuid.uuid4())
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
     opts = yt_base_opts() | {
         "outtmpl": outtmpl,
-        "format": format_for_height(height),
+        "format": build_download_format(item),
         "merge_output_format": "mp4",
     }
 
@@ -219,17 +312,18 @@ def download_youtube_video(url: str, height: int) -> Tuple[Path, str]:
 
         requested_downloads = info.get("requested_downloads")
         if requested_downloads:
-            possible = requested_downloads[0].get("filepath")
-            if possible and Path(possible).exists():
-                final_path = Path(possible)
+            for entry in requested_downloads:
+                possible = entry.get("filepath")
+                if possible and Path(possible).exists():
+                    final_path = Path(possible)
+                    break
 
         if final_path is None:
             final_path = Path(ydl.prepare_filename(info))
 
-        if final_path.suffix.lower() != ".mp4":
-            mp4_candidate = final_path.with_suffix(".mp4")
-            if mp4_candidate.exists():
-                final_path = mp4_candidate
+        mp4_candidate = final_path.with_suffix(".mp4")
+        if mp4_candidate.exists():
+            final_path = mp4_candidate
 
         title = info.get("title") or "video"
         return final_path, title
@@ -271,20 +365,6 @@ def download_generic_media(url: str) -> Tuple[Path, str, str]:
         title = info.get("title") or "media"
         ext = final_path.suffix.lower().lstrip(".")
         return final_path, title, ext
-
-
-def youtube_keyboard(token: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⚡ 240p", callback_data=f"yt|240|{token}"),
-            InlineKeyboardButton("🚀 360p", callback_data=f"yt|360|{token}"),
-            InlineKeyboardButton("🎬 480p", callback_data=f"yt|480|{token}"),
-        ],
-        [
-            InlineKeyboardButton("🎧 MP3", callback_data=f"yt|mp3|{token}"),
-            InlineKeyboardButton("🖼 Превью", callback_data=f"yt|thumb|{token}"),
-        ]
-    ])
 
 
 async def send_broadcast(application, text: str) -> tuple[int, int]:
@@ -406,6 +486,11 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             thumb = info.get("thumbnail")
             duration = info.get("duration")
 
+            format_buttons = build_youtube_formats(info)
+            if not format_buttons:
+                await status.edit_text("❌ Не удалось получить доступные форматы видео.")
+                return
+
             token = uuid.uuid4().hex[:12]
             pending_youtube[token] = {
                 "url": url,
@@ -413,6 +498,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 "thumb": thumb,
                 "duration": duration,
                 "user_id": user.id,
+                "formats": format_buttons,
             }
 
             caption = f"🎬 {title}"
@@ -420,22 +506,24 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
                 caption += f"\n⏱ {duration} сек"
             caption += "\n\nФорматы для скачивания ↓"
 
+            keyboard = youtube_keyboard(token, format_buttons)
+
             if thumb:
                 try:
                     await message.reply_photo(
                         photo=thumb,
                         caption=caption,
-                        reply_markup=youtube_keyboard(token),
+                        reply_markup=keyboard,
                     )
                 except Exception:
                     await message.reply_text(
                         caption,
-                        reply_markup=youtube_keyboard(token),
+                        reply_markup=keyboard,
                     )
             else:
                 await message.reply_text(
                     caption,
-                    reply_markup=youtube_keyboard(token),
+                    reply_markup=keyboard,
                 )
 
             await status.delete()
@@ -479,13 +567,15 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await query.answer()
 
     user = update.effective_user
-    data = (query.data or "").split("|")
+    parts = (query.data or "").split("|")
 
-    if len(data) != 3 or data[0] != "yt":
+    if len(parts) != 4 or parts[0] != "yt":
         return
 
-    action = data[1]
-    token = data[2]
+    action = parts[1]
+    token = parts[2]
+    value = parts[3]
+
     item = pending_youtube.get(token)
 
     if not item:
@@ -535,9 +625,16 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
             await processing.delete()
             return
 
-        if action in {"240", "360", "480"}:
-            height = int(action)
-            video_path, video_title = await asyncio.to_thread(download_youtube_video, url, height)
+        if action == "fmt":
+            selected_height = int(value)
+            formats_list = item.get("formats", [])
+            selected = next((x for x in formats_list if x["height"] == selected_height), None)
+
+            if not selected:
+                await processing.edit_text("❌ Формат больше недоступен.")
+                return
+
+            video_path, video_title = await asyncio.to_thread(download_youtube_video_by_format, url, selected)
 
             if not video_path.exists():
                 await processing.edit_text("❌ Видео не собралось.")
@@ -549,7 +646,7 @@ async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
                     caption=f"✅ {video_title[:900]}"
                 )
 
-            add_stat(user.id, "youtube", f"video_{height}p")
+            add_stat(user.id, "youtube", f'video_{selected["height"]}p')
             safe_delete(video_path)
             await processing.delete()
             return
