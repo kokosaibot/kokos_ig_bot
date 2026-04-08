@@ -3,17 +3,11 @@ import logging
 import os
 import re
 import sqlite3
-import uuid
 from pathlib import Path
 from typing import Optional
 
 import yt_dlp
-from telegram import (
-    InputFile,
-    InputMediaPhoto,
-    InputMediaVideo,
-    Update,
-)
+from telegram import InputFile, InputMediaPhoto, InputMediaVideo, Update
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -34,7 +28,7 @@ def save_env_file(env_name: str, filename: str) -> None:
     with open(filename, "w", encoding="utf-8") as f:
         f.write(data)
 
-    print(f"✅ {env_name} загружены в {filename}")
+    print(f"✅ {env_name} сохранены в {filename}")
 
 
 save_env_file("INSTAGRAM_COOKIES", "instagram_cookies.txt")
@@ -65,7 +59,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger("social_bot")
+logger = logging.getLogger("insta_tiktok_bot")
 
 # =========================
 # DATABASE
@@ -175,15 +169,24 @@ def safe_delete(paths: list[Path]) -> None:
             pass
 
 
+def guess_media_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return "photo"
+    if ext in {".mp4", ".mov", ".mkv", ".webm"}:
+        return "video"
+    return "file"
+
+
 def social_base_opts(platform: str) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": False,
         "socket_timeout": 30,
         "retries": 2,
         "fragment_retries": 2,
-        "outtmpl": str(DOWNLOAD_DIR / f"%(id)s_{uuid.uuid4().hex}.%(ext)s"),
+        "noplaylist": False,
+        "outtmpl": str(DOWNLOAD_DIR / "%(id)s_%(autonumber)s.%(ext)s"),
     }
 
     if platform == "instagram" and INSTAGRAM_COOKIE_FILE.exists():
@@ -195,19 +198,7 @@ def social_base_opts(platform: str) -> dict:
     return opts
 
 
-def guess_media_type(path: Path) -> str:
-    ext = path.suffix.lower()
-    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
-        return "photo"
-    if ext in {".mp4", ".mov", ".mkv", ".webm"}:
-        return "video"
-    return "file"
-
-
-def collect_downloaded_paths(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
-    """
-    Собираем реально скачанные файлы из info/entries/requested_downloads.
-    """
+def collect_paths_from_info(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
     found: list[Path] = []
 
     def add_path(p: Optional[str]) -> None:
@@ -217,7 +208,6 @@ def collect_downloaded_paths(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
         if path.exists() and path not in found:
             found.append(path)
 
-        # если после merge появился mp4
         mp4_candidate = path.with_suffix(".mp4")
         if mp4_candidate.exists() and mp4_candidate not in found:
             found.append(mp4_candidate)
@@ -230,6 +220,9 @@ def collect_downloaded_paths(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
         if requested_downloads:
             for item in requested_downloads:
                 add_path(item.get("filepath"))
+
+        filepath = obj.get("_filename")
+        add_path(filepath)
 
         try:
             prepared = ydl.prepare_filename(obj)
@@ -245,34 +238,23 @@ def collect_downloaded_paths(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
 
     walk(info)
 
-    # фильтруем только существующие медиа
-    valid = []
-    for p in found:
-        if p.exists() and guess_media_type(p) in {"photo", "video", "file"}:
-            valid.append(p)
-
-    # убираем дубли
     unique = []
     seen = set()
-    for p in valid:
-        if str(p) not in seen:
+    for p in found:
+        if p.exists() and str(p) not in seen:
             unique.append(p)
             seen.add(str(p))
 
     return unique
 
 
-def download_social_media(url: str, platform: str) -> tuple[list[Path], str]:
-    """
-    Скачивает 1 или несколько файлов.
-    Для каруселей и photo posts возвращает несколько путей.
-    """
+def download_social(url: str, platform: str) -> tuple[list[Path], str]:
     opts = social_base_opts(platform)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
         title = info.get("title") or "media"
-        paths = collect_downloaded_paths(info, ydl)
+        paths = collect_paths_from_info(info, ydl)
 
         if not paths:
             raise RuntimeError("Не удалось найти скачанные файлы после загрузки")
@@ -280,14 +262,7 @@ def download_social_media(url: str, platform: str) -> tuple[list[Path], str]:
         return paths, title
 
 
-async def send_media_list(message, files: list[Path], title: str) -> str:
-    """
-    Отправка:
-    - 1 файл -> обычная отправка
-    - несколько фото/видео -> media group пачками по 10
-    - прочее -> документами
-    Возвращает media_type для статистики
-    """
+async def send_media_items(message, files: list[Path], title: str) -> str:
     if len(files) == 1:
         path = files[0]
         media_type = guess_media_type(path)
@@ -307,44 +282,40 @@ async def send_media_list(message, files: list[Path], title: str) -> str:
             )
             return "file"
 
-    # если несколько файлов — пробуем собрать album
-    media_items = []
-    file_handles = []
+    album = []
+    handles = []
 
     try:
         for idx, path in enumerate(files):
             media_type = guess_media_type(path)
+            if media_type not in {"photo", "video"}:
+                raise ValueError("Contains non-album file")
+
             f = open(path, "rb")
-            file_handles.append(f)
+            handles.append(f)
 
             if media_type == "photo":
-                media_items.append(
+                album.append(
                     InputMediaPhoto(
                         media=InputFile(f, filename=path.name),
-                        caption=f"✅ {title[:900]}" if idx == 0 else None,
-                    )
-                )
-            elif media_type == "video":
-                media_items.append(
-                    InputMediaVideo(
-                        media=InputFile(f, filename=path.name),
-                        caption=f"✅ {title[:900]}" if idx == 0 else None,
+                        caption=f"✅ {title[:900]}" if idx == 0 else None
                     )
                 )
             else:
-                # если попался не photo/video — скидываем всё по одному ниже
-                raise ValueError("Album contains non-photo/video file")
+                album.append(
+                    InputMediaVideo(
+                        media=InputFile(f, filename=path.name),
+                        caption=f"✅ {title[:900]}" if idx == 0 else None
+                    )
+                )
 
-        # Telegram: media group максимум 10
-        for i in range(0, len(media_items), 10):
-            chunk = media_items[i:i + 10]
-            await message.reply_media_group(media=chunk)
+        for i in range(0, len(album), 10):
+            await message.reply_media_group(album[i:i + 10])
 
         return "carousel"
 
     except Exception:
-        # fallback: если media group не собрался, шлем по одному
-        for f in file_handles:
+        for f in handles:
             try:
                 f.close()
             except Exception:
@@ -366,8 +337,9 @@ async def send_media_list(message, files: list[Path], title: str) -> str:
                     )
 
         return "carousel"
+
     finally:
-        for f in file_handles:
+        for f in handles:
             try:
                 f.close()
             except Exception:
@@ -400,11 +372,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Отправь ссылку на:\n"
         "- Instagram\n"
         "- TikTok\n\n"
-        "Бот попробует скачать:\n"
+        "Поддержка:\n"
         "- reels\n"
+        "- posts\n"
         "- фото\n"
         "- карусели\n"
-        "- видео-посты"
+        "- видео"
     )
 
     if user.id == ADMIN_ID:
@@ -449,7 +422,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # =========================
-# MAIN MESSAGE HANDLER
+# MESSAGE HANDLER
 # =========================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -491,14 +464,15 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     status = await message.reply_text("⏳ Обрабатываю ссылку...")
 
     files: list[Path] = []
+
     try:
-        files, title = await asyncio.to_thread(download_social_media, url, platform)
+        files, title = await asyncio.to_thread(download_social, url, platform)
 
         if not files:
             await status.edit_text("❌ Ничего не скачалось.")
             return
 
-        media_type = await send_media_list(message, files, title)
+        media_type = await send_media_items(message, files, title)
         add_stat(user.id, platform, media_type)
 
         await status.delete()
@@ -510,8 +484,9 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
             "Что попробовать:\n"
             "1. Если пост приватный — нужны cookies\n"
             "2. Попробуй другую ссылку\n"
-            "3. Попробуй позже, если платформа душит лимит"
+            "3. Попробуй позже, если платформа режет лимит"
         )
+
     finally:
         safe_delete(files)
 
