@@ -5,13 +5,17 @@ import re
 import sqlite3
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import yt_dlp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
+from telegram import (
+    InputFile,
+    InputMediaPhoto,
+    InputMediaVideo,
+    Update,
+)
 from telegram.ext import (
     ApplicationBuilder,
-    CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
     MessageHandler,
@@ -19,21 +23,22 @@ from telegram.ext import (
 )
 
 # =========================
-# SAVE COOKIES FROM RAILWAY VARIABLE
+# SAVE COOKIES FROM RAILWAY VARIABLES
 # =========================
-def save_cookies() -> None:
-    cookies = os.getenv("YOUTUBE_COOKIES")
-    if not cookies:
-        print("❌ Нет YOUTUBE_COOKIES в переменных")
+def save_env_file(env_name: str, filename: str) -> None:
+    data = os.getenv(env_name)
+    if not data:
+        print(f"⚠️ Нет {env_name}")
         return
 
-    with open("cookies.txt", "w", encoding="utf-8") as f:
-        f.write(cookies)
+    with open(filename, "w", encoding="utf-8") as f:
+        f.write(data)
 
-    print("✅ YouTube cookies загружены")
+    print(f"✅ {env_name} загружены в {filename}")
 
 
-save_cookies()
+save_env_file("INSTAGRAM_COOKIES", "instagram_cookies.txt")
+save_env_file("TIKTOK_COOKIES", "tiktok_cookies.txt")
 
 # =========================
 # CONFIG
@@ -53,13 +58,14 @@ DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 DB_PATH = BASE_DIR / "bot.db"
-COOKIE_FILE = BASE_DIR / "cookies.txt"
+INSTAGRAM_COOKIE_FILE = BASE_DIR / "instagram_cookies.txt"
+TIKTOK_COOKIE_FILE = BASE_DIR / "tiktok_cookies.txt"
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s"
 )
-logger = logging.getLogger("kokos_bot")
+logger = logging.getLogger("social_bot")
 
 # =========================
 # DATABASE
@@ -129,12 +135,10 @@ def get_stats_summary() -> list[tuple[str, str, int]]:
 # STATE
 # =========================
 URL_RE = re.compile(r"(https?://[^\s]+)", re.IGNORECASE)
-YOUTUBE_RE = re.compile(r"(youtube\.com|youtu\.be)", re.IGNORECASE)
 INSTAGRAM_RE = re.compile(r"(instagram\.com)", re.IGNORECASE)
 TIKTOK_RE = re.compile(r"(tiktok\.com)", re.IGNORECASE)
 
 broadcast_waiting: set[int] = set()
-pending_youtube: dict[str, dict] = {}
 
 
 # =========================
@@ -146,23 +150,11 @@ def extract_url(text: str) -> Optional[str]:
 
 
 def detect_platform(url: str) -> str:
-    if YOUTUBE_RE.search(url):
-        return "youtube"
     if INSTAGRAM_RE.search(url):
         return "instagram"
     if TIKTOK_RE.search(url):
         return "tiktok"
     return "unknown"
-
-
-def safe_delete(path: Optional[Path]) -> None:
-    if not path:
-        return
-    try:
-        if path.exists():
-            path.unlink()
-    except Exception:
-        pass
 
 
 def cleanup_old_downloads() -> None:
@@ -174,211 +166,212 @@ def cleanup_old_downloads() -> None:
             pass
 
 
-def yt_base_opts() -> dict:
+def safe_delete(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            if path.exists():
+                path.unlink()
+        except Exception:
+            pass
+
+
+def social_base_opts(platform: str) -> dict:
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "noplaylist": True,
+        "noplaylist": False,
         "socket_timeout": 30,
         "retries": 2,
         "fragment_retries": 2,
+        "outtmpl": str(DOWNLOAD_DIR / f"%(id)s_{uuid.uuid4().hex}.%(ext)s"),
     }
 
-    if COOKIE_FILE.exists():
-        opts["cookiefile"] = str(COOKIE_FILE)
+    if platform == "instagram" and INSTAGRAM_COOKIE_FILE.exists():
+        opts["cookiefile"] = str(INSTAGRAM_COOKIE_FILE)
+
+    if platform == "tiktok" and TIKTOK_COOKIE_FILE.exists():
+        opts["cookiefile"] = str(TIKTOK_COOKIE_FILE)
 
     return opts
 
 
-def get_youtube_info(url: str) -> dict:
-    opts = yt_base_opts() | {
-        "skip_download": True,
-    }
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+def guess_media_type(path: Path) -> str:
+    ext = path.suffix.lower()
+    if ext in {".jpg", ".jpeg", ".png", ".webp"}:
+        return "photo"
+    if ext in {".mp4", ".mov", ".mkv", ".webm"}:
+        return "video"
+    return "file"
 
 
+def collect_downloaded_paths(info: dict, ydl: yt_dlp.YoutubeDL) -> list[Path]:
+    """
+    Собираем реально скачанные файлы из info/entries/requested_downloads.
+    """
+    found: list[Path] = []
 
-def youtube_keyboard(token: str, format_buttons: list[dict]) -> InlineKeyboardMarkup:
-    rows = []
-    current_row = []
+    def add_path(p: Optional[str]) -> None:
+        if not p:
+            return
+        path = Path(p)
+        if path.exists() and path not in found:
+            found.append(path)
 
-    for idx, item in enumerate(format_buttons):
-        label = f'{item["height"]}p'
-        current_row.append(
-            InlineKeyboardButton(label, callback_data=f"yt|fmt|{token}|{idx}")
-        )
-        if len(current_row) == 3:
-            rows.append(current_row)
-            current_row = []
+        # если после merge появился mp4
+        mp4_candidate = path.with_suffix(".mp4")
+        if mp4_candidate.exists() and mp4_candidate not in found:
+            found.append(mp4_candidate)
 
-    if current_row:
-        rows.append(current_row)
+    def walk(obj: dict) -> None:
+        if not isinstance(obj, dict):
+            return
 
-    rows.append([
-        InlineKeyboardButton("🎧 MP3", callback_data=f"yt|mp3|{token}|0"),
-        InlineKeyboardButton("🖼 Превью", callback_data=f"yt|thumb|{token}|0"),
-    ])
+        requested_downloads = obj.get("requested_downloads")
+        if requested_downloads:
+            for item in requested_downloads:
+                add_path(item.get("filepath"))
 
-    return InlineKeyboardMarkup(rows)
-def build_youtube_formats(info: dict) -> list[dict]:
-    formats = info.get("formats", [])
-    result = []
-
-    for f in formats:
-        fmt_id = f.get("format_id")
-        height = f.get("height")
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-        protocol = f.get("protocol") or ""
-        note = (f.get("format_note") or "").lower()
-
-        if not fmt_id or not height:
-            continue
-
-        # пропускаем чистое аудио
-        if vcodec == "none":
-            continue
-
-        # пропускаем storyboard / странные служебные форматы
-        if "storyboard" in note:
-            continue
-
-        # оставляем только более реальные варианты
-        # http/https = самый безопасный вариант
-        if protocol not in ("https", "http"):
-            continue
-
-        result.append({
-            "format_id": str(fmt_id),
-            "height": int(height),
-            "ext": ext or "",
-            "has_audio": acodec not in (None, "none"),
-            "note": f.get("format_note") or "",
-            "tbr": f.get("tbr") or 0,
-        })
-
-    # сортировка
-    result.sort(key=lambda x: (x["height"], x["tbr"]))
-
-    # по одной лучшей кнопке на каждую высоту
-    by_height = {}
-    for item in result:
-        h = item["height"]
-        prev = by_height.get(h)
-
-        score = 0
-        if item["ext"] == "mp4":
-            score += 3
-        if item["has_audio"]:
-            score += 2
-        score += min(int(item["tbr"] or 0), 9999) / 10000
-
-        if prev is None or score > prev[0]:
-            by_height[h] = (score, item)
-
-    cleaned = [v[1] for v in by_height.values()]
-    cleaned.sort(key=lambda x: x["height"])
-
-    return cleaned[:6]
-
-def build_download_format(item: dict) -> str:
-    fmt_id = str(item["format_id"])
-
-    # если в формате уже есть аудио — берем как есть
-    if item["has_audio"]:
-        return fmt_id
-
-    # если аудио нет — цепляем bestaudio
-    return f"{fmt_id}+bestaudio/best"
-
-def download_youtube_video_by_format(url: str, item: dict) -> Tuple[Path, str]:
-    file_id = str(uuid.uuid4())
-    outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
-
-    attempts = [
-        build_download_format(item),
-        "best[ext=mp4]/best",
-        "bestvideo+bestaudio/best",
-        "best",
-    ]
-
-    last_error = None
-
-    for fmt in attempts:
         try:
-            opts = yt_base_opts() | {
-                "outtmpl": outtmpl,
-                "format": fmt,
-                "merge_output_format": "mp4",
-            }
+            prepared = ydl.prepare_filename(obj)
+            add_path(prepared)
+        except Exception:
+            pass
 
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                info = ydl.extract_info(url, download=True)
+        entries = obj.get("entries")
+        if entries:
+            for entry in entries:
+                if isinstance(entry, dict):
+                    walk(entry)
 
-                final_path = None
-                requested_downloads = info.get("requested_downloads")
-                if requested_downloads:
-                    for entry in requested_downloads:
-                        possible = entry.get("filepath")
-                        if possible and Path(possible).exists():
-                            final_path = Path(possible)
-                            break
+    walk(info)
 
-                if final_path is None:
-                    final_path = Path(ydl.prepare_filename(info))
+    # фильтруем только существующие медиа
+    valid = []
+    for p in found:
+        if p.exists() and guess_media_type(p) in {"photo", "video", "file"}:
+            valid.append(p)
 
-                mp4_candidate = final_path.with_suffix(".mp4")
-                if mp4_candidate.exists():
-                    final_path = mp4_candidate
+    # убираем дубли
+    unique = []
+    seen = set()
+    for p in valid:
+        if str(p) not in seen:
+            unique.append(p)
+            seen.add(str(p))
 
-                title = info.get("title") or "video"
-                return final_path, title
-
-        except Exception as e:
-            last_error = e
-
-    raise last_error
+    return unique
 
 
-
-def download_youtube_audio(url: str) -> Tuple[Path, str]:
-    file_id = str(uuid.uuid4())
-    outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
-
-    opts = yt_base_opts() | {
-        "outtmpl": outtmpl,
-        "format": "bestaudio/best",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-    }
+def download_social_media(url: str, platform: str) -> tuple[list[Path], str]:
+    """
+    Скачивает 1 или несколько файлов.
+    Для каруселей и photo posts возвращает несколько путей.
+    """
+    opts = social_base_opts(platform)
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        title = info.get("title") or "audio"
-        mp3_path = DOWNLOAD_DIR / f"{file_id}.mp3"
-        return mp3_path, title
-
-
-def download_generic_media(url: str) -> Tuple[Path, str, str]:
-    file_id = str(uuid.uuid4())
-    outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
-
-    opts = yt_base_opts() | {
-        "outtmpl": outtmpl,
-        "format": "best",
-    }
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        final_path = Path(ydl.prepare_filename(info))
         title = info.get("title") or "media"
-        ext = final_path.suffix.lower().lstrip(".")
-        return final_path, title, ext
+        paths = collect_downloaded_paths(info, ydl)
+
+        if not paths:
+            raise RuntimeError("Не удалось найти скачанные файлы после загрузки")
+
+        return paths, title
+
+
+async def send_media_list(message, files: list[Path], title: str) -> str:
+    """
+    Отправка:
+    - 1 файл -> обычная отправка
+    - несколько фото/видео -> media group пачками по 10
+    - прочее -> документами
+    Возвращает media_type для статистики
+    """
+    if len(files) == 1:
+        path = files[0]
+        media_type = guess_media_type(path)
+
+        with open(path, "rb") as f:
+            if media_type == "photo":
+                await message.reply_photo(photo=f, caption=f"✅ {title[:900]}")
+                return "photo"
+
+            if media_type == "video":
+                await message.reply_video(video=f, caption=f"✅ {title[:900]}")
+                return "video"
+
+            await message.reply_document(
+                document=InputFile(f, filename=path.name),
+                caption=f"✅ {title[:900]}"
+            )
+            return "file"
+
+    # если несколько файлов — пробуем собрать album
+    media_items = []
+    file_handles = []
+
+    try:
+        for idx, path in enumerate(files):
+            media_type = guess_media_type(path)
+            f = open(path, "rb")
+            file_handles.append(f)
+
+            if media_type == "photo":
+                media_items.append(
+                    InputMediaPhoto(
+                        media=InputFile(f, filename=path.name),
+                        caption=f"✅ {title[:900]}" if idx == 0 else None,
+                    )
+                )
+            elif media_type == "video":
+                media_items.append(
+                    InputMediaVideo(
+                        media=InputFile(f, filename=path.name),
+                        caption=f"✅ {title[:900]}" if idx == 0 else None,
+                    )
+                )
+            else:
+                # если попался не photo/video — скидываем всё по одному ниже
+                raise ValueError("Album contains non-photo/video file")
+
+        # Telegram: media group максимум 10
+        for i in range(0, len(media_items), 10):
+            chunk = media_items[i:i + 10]
+            await message.reply_media_group(media=chunk)
+
+        return "carousel"
+
+    except Exception:
+        # fallback: если media group не собрался, шлем по одному
+        for f in file_handles:
+            try:
+                f.close()
+            except Exception:
+                pass
+
+        for idx, path in enumerate(files):
+            media_type = guess_media_type(path)
+            with open(path, "rb") as f:
+                caption = f"✅ {title[:900]}" if idx == 0 else None
+
+                if media_type == "photo":
+                    await message.reply_photo(photo=f, caption=caption)
+                elif media_type == "video":
+                    await message.reply_video(video=f, caption=caption)
+                else:
+                    await message.reply_document(
+                        document=InputFile(f, filename=path.name),
+                        caption=caption
+                    )
+
+        return "carousel"
+    finally:
+        for f in file_handles:
+            try:
+                f.close()
+            except Exception:
+                pass
 
 
 async def send_broadcast(application, text: str) -> tuple[int, int]:
@@ -406,8 +399,12 @@ async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "Салам 👋\n\n"
         "Отправь ссылку на:\n"
         "- Instagram\n"
-        "- YouTube\n"
-        "- TikTok"
+        "- TikTok\n\n"
+        "Бот попробует скачать:\n"
+        "- reels\n"
+        "- фото\n"
+        "- карусели\n"
+        "- видео-посты"
     )
 
     if user.id == ADMIN_ID:
@@ -452,7 +449,7 @@ async def broadcast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # =========================
-# MESSAGE HANDLER
+# MAIN MESSAGE HANDLER
 # =========================
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.message
@@ -483,196 +480,40 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
     url = extract_url(text)
     if not url:
-        await message.reply_text("Скинь нормальную ссылку.")
+        await message.reply_text("Скинь нормальную ссылку из Instagram или TikTok.")
         return
 
     platform = detect_platform(url)
     if platform == "unknown":
-        await message.reply_text("Пока поддерживаются только YouTube, Instagram и TikTok.")
+        await message.reply_text("Пока поддерживаются только Instagram и TikTok.")
         return
 
     status = await message.reply_text("⏳ Обрабатываю ссылку...")
 
+    files: list[Path] = []
     try:
-        if platform == "youtube":
-            info = await asyncio.to_thread(get_youtube_info, url)
-            title = info.get("title") or "YouTube"
-            thumb = info.get("thumbnail")
-            duration = info.get("duration")
+        files, title = await asyncio.to_thread(download_social_media, url, platform)
 
-            format_buttons = build_youtube_formats(info)
-            if not format_buttons:
-                await status.edit_text("❌ Не удалось получить доступные форматы видео.")
-                return
-
-            token = uuid.uuid4().hex[:12]
-            pending_youtube[token] = {
-                "url": url,
-                "title": title,
-                "thumb": thumb,
-                "duration": duration,
-                "user_id": user.id,
-                "formats": format_buttons,
-            }
-
-            caption = f"🎬 {title}"
-            if duration:
-                caption += f"\n⏱ {duration} сек"
-            caption += "\n\nФорматы для скачивания ↓"
-
-            keyboard = youtube_keyboard(token, format_buttons)
-
-            if thumb:
-                try:
-                    await message.reply_photo(
-                        photo=thumb,
-                        caption=caption,
-                        reply_markup=keyboard,
-                    )
-                except Exception:
-                    await message.reply_text(
-                        caption,
-                        reply_markup=keyboard,
-                    )
-            else:
-                await message.reply_text(
-                    caption,
-                    reply_markup=keyboard,
-                )
-
-            await status.delete()
+        if not files:
+            await status.edit_text("❌ Ничего не скачалось.")
             return
 
-        media_path, title, ext = await asyncio.to_thread(download_generic_media, url)
-
-        if not media_path.exists():
-            await status.edit_text("❌ Файл не найден после загрузки.")
-            return
-
-        ext_lower = ext.lower()
-
-        with open(media_path, "rb") as f:
-            if ext_lower in {"jpg", "jpeg", "png", "webp"}:
-                await message.reply_photo(photo=f, caption=f"✅ {title[:900]}")
-                add_stat(user.id, platform, "photo")
-            elif ext_lower in {"mp4", "mov", "mkv", "webm"}:
-                await message.reply_video(video=f, caption=f"✅ {title[:900]}")
-                add_stat(user.id, platform, "video")
-            else:
-                await message.reply_document(
-                    document=InputFile(f, filename=media_path.name),
-                    caption=f"✅ {title[:900]}"
-                )
-                add_stat(user.id, platform, "file")
+        media_type = await send_media_list(message, files, title)
+        add_stat(user.id, platform, media_type)
 
         await status.delete()
-        safe_delete(media_path)
 
     except Exception as e:
-        logger.exception("TEXT HANDLER ERROR")
-        await status.edit_text(f"❌ Ошибка:\n{str(e)[:350]}")
-
-
-# =========================
-# CALLBACK HANDLER
-# =========================
-async def youtube_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
-
-    user = update.effective_user
-    parts = (query.data or "").split("|")
-
-    if len(parts) != 4 or parts[0] != "yt":
-        return
-
-    action = parts[1]
-    token = parts[2]
-    value = parts[3]
-
-    item = pending_youtube.get(token)
-
-    if not item:
-        try:
-            await query.edit_message_caption(
-                caption="❌ Ссылка устарела. Отправь заново.",
-                reply_markup=None,
-            )
-        except Exception:
-            await query.message.reply_text("❌ Ссылка устарела. Отправь заново.")
-        return
-
-    if item["user_id"] != user.id and user.id != ADMIN_ID:
-        await query.answer("Это не твоя кнопка", show_alert=True)
-        return
-
-    url = item["url"]
-    title = item["title"]
-
-    try:
-        if action == "thumb":
-            thumb = item.get("thumb")
-            if thumb:
-                await query.message.reply_photo(photo=thumb, caption=f"🖼 {title[:900]}")
-            else:
-                await query.message.reply_text("У этого видео нет превью.")
-            return
-
-        processing = await query.message.reply_text("⏳ Скачиваю...")
-
-        if action == "mp3":
-            audio_path, audio_title = await asyncio.to_thread(download_youtube_audio, url)
-
-            if not audio_path.exists():
-                await processing.edit_text("❌ MP3 не собрался.")
-                return
-
-            with open(audio_path, "rb") as f:
-                await query.message.reply_audio(
-                    audio=f,
-                    title=audio_title[:64],
-                    caption="🎧 Готово"
-                )
-
-            add_stat(user.id, "youtube", "audio")
-            safe_delete(audio_path)
-            await processing.delete()
-            return
-
-        if action == "fmt":
-            selected_index = int(value)
-            formats_list = item.get("formats", [])
-
-            if selected_index < 0 or selected_index >= len(formats_list):
-                await processing.edit_text("❌ Формат больше недоступен.")
-                return
-
-            selected = formats_list[selected_index]
-
-            video_path, video_title = await asyncio.to_thread(
-                download_youtube_video_by_format,
-                url,
-                selected
-            )
-
-            if not video_path.exists():
-                await processing.edit_text("❌ Видео не собралось.")
-                return
-
-            with open(video_path, "rb") as f:
-                await query.message.reply_video(
-                    video=f,
-                    caption=f"✅ {video_title[:900]}"
-                )
-
-            add_stat(user.id, "youtube", f'video_{selected["height"]}p')
-            safe_delete(video_path)
-            await processing.delete()
-            return
-
-    except Exception as e:
-        logger.exception("YOUTUBE CALLBACK ERROR")
-        await query.message.reply_text(f"❌ Ошибка:\n{str(e)[:350]}")
+        logger.exception("SOCIAL DOWNLOAD ERROR")
+        await status.edit_text(
+            f"❌ Ошибка:\n{str(e)[:350]}\n\n"
+            "Что попробовать:\n"
+            "1. Если пост приватный — нужны cookies\n"
+            "2. Попробуй другую ссылку\n"
+            "3. Попробуй позже, если платформа душит лимит"
+        )
+    finally:
+        safe_delete(files)
 
 
 # =========================
@@ -694,12 +535,11 @@ def main() -> None:
     app.add_handler(CommandHandler("users", users_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
-    app.add_handler(CallbackQueryHandler(youtube_callback, pattern=r"^yt\|"))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.add_error_handler(error_handler)
 
-    logger.info("Bot started")
+    logger.info("Instagram/TikTok bot started")
     app.run_polling()
 
 
