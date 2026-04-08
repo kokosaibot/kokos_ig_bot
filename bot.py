@@ -198,62 +198,6 @@ def get_youtube_info(url: str) -> dict:
         return ydl.extract_info(url, download=False)
 
 
-def build_youtube_formats(info: dict) -> list[dict]:
-    """
-    Берем реальные форматы ролика и строим кнопки только по тем,
-    что реально доступны.
-    """
-    formats = info.get("formats", [])
-    result = []
-
-    for f in formats:
-        fmt_id = f.get("format_id")
-        height = f.get("height")
-        vcodec = f.get("vcodec")
-        acodec = f.get("acodec")
-        ext = f.get("ext")
-
-        if not fmt_id or not height:
-            continue
-
-        # Пропускаем чистое аудио
-        if vcodec == "none":
-            continue
-
-        result.append({
-            "format_id": fmt_id,
-            "height": int(height),
-            "ext": ext or "",
-            "has_audio": acodec not in (None, "none"),
-            "note": f.get("format_note") or "",
-            "tbr": f.get("tbr") or 0,
-        })
-
-    # Сортируем: высота + bitrate
-    result.sort(key=lambda x: (x["height"], x["tbr"]))
-
-    # Оставляем один лучший формат на каждую высоту
-    by_height = {}
-    for item in result:
-        h = item["height"]
-        prev = by_height.get(h)
-
-        score = 0
-        if item["ext"] == "mp4":
-            score += 3
-        if item["has_audio"]:
-            score += 2
-        score += min(int(item["tbr"] or 0), 9999) / 10000
-
-        if prev is None or score > prev[0]:
-            by_height[h] = (score, item)
-
-    cleaned = [v[1] for v in by_height.values()]
-    cleaned.sort(key=lambda x: x["height"])
-
-    # максимум 6 кнопок
-    return cleaned[:6]
-
 
 def youtube_keyboard(token: str, format_buttons: list[dict]) -> InlineKeyboardMarkup:
     rows = []
@@ -277,26 +221,85 @@ def youtube_keyboard(token: str, format_buttons: list[dict]) -> InlineKeyboardMa
     ])
 
     return InlineKeyboardMarkup(rows)
+def build_youtube_formats(info: dict) -> list[dict]:
+    formats = info.get("formats", [])
+    result = []
 
+    for f in formats:
+        fmt_id = f.get("format_id")
+        height = f.get("height")
+        vcodec = f.get("vcodec")
+        acodec = f.get("acodec")
+        ext = f.get("ext")
+        protocol = f.get("protocol") or ""
+        note = (f.get("format_note") or "").lower()
+
+        if not fmt_id or not height:
+            continue
+
+        # пропускаем чистое аудио
+        if vcodec == "none":
+            continue
+
+        # пропускаем storyboard / странные служебные форматы
+        if "storyboard" in note:
+            continue
+
+        # оставляем только более реальные варианты
+        # http/https = самый безопасный вариант
+        if protocol not in ("https", "http"):
+            continue
+
+        result.append({
+            "format_id": str(fmt_id),
+            "height": int(height),
+            "ext": ext or "",
+            "has_audio": acodec not in (None, "none"),
+            "note": f.get("format_note") or "",
+            "tbr": f.get("tbr") or 0,
+        })
+
+    # сортировка
+    result.sort(key=lambda x: (x["height"], x["tbr"]))
+
+    # по одной лучшей кнопке на каждую высоту
+    by_height = {}
+    for item in result:
+        h = item["height"]
+        prev = by_height.get(h)
+
+        score = 0
+        if item["ext"] == "mp4":
+            score += 3
+        if item["has_audio"]:
+            score += 2
+        score += min(int(item["tbr"] or 0), 9999) / 10000
+
+        if prev is None or score > prev[0]:
+            by_height[h] = (score, item)
+
+    cleaned = [v[1] for v in by_height.values()]
+    cleaned.sort(key=lambda x: x["height"])
+
+    return cleaned[:6]
 
 def build_download_format(item: dict) -> str:
-    fmt_id = item["format_id"]
+    fmt_id = str(item["format_id"])
+
+    # если в формате уже есть аудио — берем как есть
     if item["has_audio"]:
         return fmt_id
-    return f"{fmt_id}+bestaudio/best"
 
+    # если аудио нет — цепляем bestaudio
+    return f"{fmt_id}+bestaudio/best"
 
 def download_youtube_video_by_format(url: str, item: dict) -> Tuple[Path, str]:
     file_id = str(uuid.uuid4())
     outtmpl = str(DOWNLOAD_DIR / f"{file_id}.%(ext)s")
 
-    base_opts = yt_base_opts() | {
-        "outtmpl": outtmpl,
-        "merge_output_format": "mp4",
-    }
-
     attempts = [
         build_download_format(item),
+        "best[ext=mp4]/best",
         "bestvideo+bestaudio/best",
         "best",
     ]
@@ -305,12 +308,16 @@ def download_youtube_video_by_format(url: str, item: dict) -> Tuple[Path, str]:
 
     for fmt in attempts:
         try:
-            opts = base_opts | {"format": fmt}
+            opts = yt_base_opts() | {
+                "outtmpl": outtmpl,
+                "format": fmt,
+                "merge_output_format": "mp4",
+            }
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
 
                 final_path = None
-
                 requested_downloads = info.get("requested_downloads")
                 if requested_downloads:
                     for entry in requested_downloads:
@@ -328,10 +335,12 @@ def download_youtube_video_by_format(url: str, item: dict) -> Tuple[Path, str]:
 
                 title = info.get("title") or "video"
                 return final_path, title
+
         except Exception as e:
             last_error = e
 
     raise last_error
+
 
 
 def download_youtube_audio(url: str) -> Tuple[Path, str]:
