@@ -196,9 +196,9 @@ def get_youtube_info(url: str) -> dict:
 
 def format_for_height(height: int) -> str:
     return (
-        f"bestvideo[height<={height}][ext=mp4]+bestaudio[ext=m4a]/"
-        f"best[height<={height}][ext=mp4]/"
-        f"best[height<={height}]"
+        f"bestvideo[height<={height}]+bestaudio/"
+        f"best[height<={height}]/"
+        f"best"
     )
 
 
@@ -214,7 +214,17 @@ def download_youtube_video(url: str, height: int) -> Tuple[Path, str]:
 
     with yt_dlp.YoutubeDL(opts) as ydl:
         info = ydl.extract_info(url, download=True)
-        final_path = Path(ydl.prepare_filename(info))
+
+        final_path = None
+
+        requested_downloads = info.get("requested_downloads")
+        if requested_downloads:
+            possible = requested_downloads[0].get("filepath")
+            if possible and Path(possible).exists():
+                final_path = Path(possible)
+
+        if final_path is None:
+            final_path = Path(ydl.prepare_filename(info))
 
         if final_path.suffix.lower() != ".mp4":
             mp4_candidate = final_path.with_suffix(".mp4")
